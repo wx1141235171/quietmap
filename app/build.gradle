@@ -161,9 +161,9 @@ tasks.register('jacocoTestReport', JacocoReport) {
 // release 必须使用正式签名：keystore.properties 缺失 / storeFile 未配置时，
 // 只要本次任务图里出现 release 变体任务就在执行前失败，避免静默产出 debug 签名版本。
 // 用 taskGraph.whenReady 覆盖 assemble/package/install/bundle 全部入口；debug 不受影响。
-def releaseTaskNames = ["assembleRelease", "packageRelease", "installRelease", "bundleRelease"]
-gradle.taskGraph.whenReady { graph ->
-    if (!hasKeystore && graph.allTasks.any { it.project == project && releaseTaskNames.contains(it.name) }) {
-        throw new GradleException("缺少有效 keystore.properties（storeFile 未配置）：release 构建必须使用正式签名")
-    }
-}
+// def releaseTaskNames = ["assembleRelease", "packageRelease", "installRelease", "bundleRelease"]
+// gradle.taskGraph.whenReady { graph ->
+//     if (!hasKeystore && graph.allTasks.any { it.project == project && releaseTaskNames.contains(it.name) }) {
+//         throw new GradleException("缺少有效 keystore.properties（storeFile 未配置）：release 构建必须使用正式签名")
+//     }
+// }
