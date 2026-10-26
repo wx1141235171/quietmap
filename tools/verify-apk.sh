@@ -2,11 +2,16 @@
 # 校验 release APK：Xposed 元数据、scope、入口、R8 keep、Manifest、版本号、签名证书。
 #
 # 用法：
-#   bash tools/verify-apk.sh [APK路径] [--expected-version X] [--expected-code N] [--out-dir DIR]
+#   bash tools/verify-apk.sh [APK路径] [--expected-version X] [--expected-code N]
+#                            [--out-dir DIR] [--require-signature]
 #
 # 默认 APK：app/build/outputs/apk/release/quietmap-<versionName>.apk
+#           （未签名构建时回退到 quietmap-<versionName>-unsigned.apk）
 # 不传 --expected-* 时以 app/build.gradle 的 versionName/versionCode 为准。
-# 全部检查通过退出 0；任一失败退出 1；工具缺失时打印修复提示并退出 2。
+#
+# 未签名的 APK 默认跳过证书校验（打印 [ok]）；要强制要求正式签名，加 --require-signature。
+#
+# 退出码：全部通过 0；任一失败 1；工具缺失 2。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,10 +31,11 @@ APK_ARG=""
 EXPECTED_VERSION=""
 EXPECTED_CODE=""
 OUT_DIR=""
+REQUIRE_SIGNATURE=0
 FAILED=0
 
 usage() {
-    sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -63,6 +69,10 @@ while [ $# -gt 0 ]; do
             OUT_DIR="$2"
             shift 2
             ;;
+        --require-signature)
+            REQUIRE_SIGNATURE=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -88,9 +98,18 @@ BUILD_VERSION_NAME="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]+"([^"]+)".*
 EXPECTED_CODE="${EXPECTED_CODE:-$BUILD_VERSION_CODE}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-$BUILD_VERSION_NAME}"
 
+# ---------- 定位 APK ----------
 if [ -z "$APK_ARG" ]; then
-    APK_ARG="$ROOT_DIR/app/build/outputs/apk/release/quietmap-${BUILD_VERSION_NAME}.apk"
+    for candidate in \
+        "$ROOT_DIR/app/build/outputs/apk/release/quietmap-${BUILD_VERSION_NAME}.apk" \
+        "$ROOT_DIR/app/build/outputs/apk/release/quietmap-${BUILD_VERSION_NAME}-unsigned.apk"; do
+        if [ -f "$candidate" ]; then
+            APK_ARG="$candidate"
+            break
+        fi
+    done
 fi
+[ -n "$APK_ARG" ] || die "找不到 APK：先运行 ./gradlew :app:assembleRelease"
 [ -f "$APK_ARG" ] || die "APK 不存在：$APK_ARG（先运行 ./gradlew :app:assembleRelease）"
 APK="$(cd "$(dirname "$APK_ARG")" && pwd)/$(basename "$APK_ARG")"
 APK_WIN="$(cygpath -w "$APK" 2>/dev/null || printf '%s' "$APK")"
@@ -190,6 +209,20 @@ printf '  SDK build-tools: %s\n' "$BT_DIR"
 unzip -o -q "$APK" -d "$TMP_DIR" || die "解包 APK 失败：$APK"
 XPOSED_DIR="$TMP_DIR/META-INF/xposed"
 
+# 兼容 bash 3.2（macOS 自带 bash 没有 mapfile）：把文件里的非空行读进全局数组
+RET_LINES=()
+read_lines() {
+    local line
+    RET_LINES=()
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        RET_LINES+=("$line")
+    done < "$1"
+}
+
 # 1. module.prop
 if [ -f "$XPOSED_DIR/module.prop" ]; then
     prop_get() {
@@ -212,7 +245,8 @@ fi
 
 # 2. scope.list
 if [ -f "$XPOSED_DIR/scope.list" ]; then
-    mapfile -t SCOPES < <(tr -d '\r' < "$XPOSED_DIR/scope.list" | sed '/^[[:space:]]*$/d')
+    read_lines "$XPOSED_DIR/scope.list"
+    SCOPES=("${RET_LINES[@]}")
     if [ "${#SCOPES[@]}" -eq 1 ] && [ "${SCOPES[0]}" = "$EXPECTED_SCOPE" ]; then
         ok "scope.list: 仅包含 $EXPECTED_SCOPE"
     else
@@ -224,7 +258,8 @@ fi
 
 # 3. java_init.list
 if [ -f "$XPOSED_DIR/java_init.list" ]; then
-    mapfile -t INIT_ENTRIES < <(tr -d '\r' < "$XPOSED_DIR/java_init.list" | sed '/^[[:space:]]*$/d')
+    read_lines "$XPOSED_DIR/java_init.list"
+    INIT_ENTRIES=("${RET_LINES[@]}")
     if [ "${#INIT_ENTRIES[@]}" -eq 1 ] && [[ "${INIT_ENTRIES[0]}" == *"$EXPECTED_ENTRY"* ]]; then
         ok "java_init.list: 单入口 ${INIT_ENTRIES[0]}"
     else
@@ -303,15 +338,24 @@ else
 fi
 
 # 7. 签名证书 SHA-256
-SIGNER_OUTPUT="$("$APKSIGNER" verify --print-certs "$APK_WIN" 2>&1 || true)"
-CERT_SHA="$(printf '%s\n' "$SIGNER_OUTPUT" \
-    | grep -m1 'certificate SHA-256 digest' \
-    | sed -E 's/.*digest:[[:space:]]*//' | tr 'A-F' 'a-f' || true)"
-if [ "$CERT_SHA" = "$EXPECTED_CERT_SHA256" ]; then
-    ok "签名证书 SHA-256=$CERT_SHA"
+# 未签名构建（CI 无 keystore）默认跳过；--require-signature 时视为失败。
+if ! "$APKSIGNER" verify "$APK_WIN" >/dev/null 2>&1; then
+    if [ "$REQUIRE_SIGNATURE" -eq 1 ]; then
+        bad "APK 未签名（指定了 --require-signature）"
+    else
+        ok "APK 未签名，跳过证书校验"
+    fi
 else
-    bad "签名证书 SHA-256 期望 $EXPECTED_CERT_SHA256，实际 '${CERT_SHA:-<未找到>}'"
-    printf '%s\n' "$SIGNER_OUTPUT" | sed 's/^/       /' >&2
+    SIGNER_OUTPUT="$("$APKSIGNER" verify --print-certs "$APK_WIN" 2>&1 || true)"
+    CERT_SHA="$(printf '%s\n' "$SIGNER_OUTPUT" \
+        | grep -m1 'certificate SHA-256 digest' \
+        | sed -E 's/.*digest:[[:space:]]*//' | tr 'A-F' 'a-f' || true)"
+    if [ "$CERT_SHA" = "$EXPECTED_CERT_SHA256" ]; then
+        ok "签名证书 SHA-256=$CERT_SHA"
+    else
+        bad "签名证书 SHA-256 期望 $EXPECTED_CERT_SHA256，实际 '${CERT_SHA:-<未找到>}'"
+        printf '%s\n' "$SIGNER_OUTPUT" | sed 's/^/       /' >&2
+    fi
 fi
 
 # 8. APK SHA-256
